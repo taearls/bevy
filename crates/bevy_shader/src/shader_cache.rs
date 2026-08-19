@@ -188,21 +188,20 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
 
         let data = self.data.entry(id).or_default();
 
-        // Wesl imports are scanned as both module and item candidates.
-        if !matches!(shader.source, Source::Wesl(_)) {
-            let n_asset_imports = shader
-                .imports
-                .iter()
-                .filter(|import| matches!(import, ShaderImport::AssetPath(_)))
-                .count();
-            let n_resolved_asset_imports = data
-                .resolved_imports
-                .keys()
-                .filter(|import| matches!(import, ShaderImport::AssetPath(_)))
-                .count();
-            if n_asset_imports != n_resolved_asset_imports {
-                return Err(ShaderCacheError::ShaderImportNotYetAvailable);
-            }
+        // Every scanned import names a module the source actually refers to, so all of them
+        // must resolve before the shader can compile.
+        let n_asset_imports = shader
+            .imports
+            .iter()
+            .filter(|import| matches!(import, ShaderImport::AssetPath(_)))
+            .count();
+        let n_resolved_asset_imports = data
+            .resolved_imports
+            .keys()
+            .filter(|import| matches!(import, ShaderImport::AssetPath(_)))
+            .count();
+        if n_asset_imports != n_resolved_asset_imports {
+            return Err(ShaderCacheError::ShaderImportNotYetAvailable);
         }
 
         data.pipelines.insert(pipeline);
@@ -753,5 +752,143 @@ fn fragment() -> @location(0) vec4<f32> { return batch_b[0]; }
         cache.set_shader(lighting_id, lighting);
         cache.set_shader(root_id, root);
         (maths_id, lighting_id, root_id)
+    }
+
+    /// Cases derived from the upstream `wesl-testsuite` corpus
+    /// (<https://github.com/wgsl-tooling-wg/wesl-testsuite>, `importCases.json`).
+    ///
+    /// Its fixtures assert on exact compiled WGSL, which Bevy cannot match: it compiles with
+    /// `wesl::EscapeMangler` and injects a synthetic `constants` module, so identifiers and
+    /// preamble both differ. These therefore port the *scenarios* and assert on structure and
+    /// substrings instead. Re-check by hand when the `wesl` dependency is upgraded.
+    mod conformance {
+        use super::*;
+
+        fn id(n: u128) -> AssetId<Shader> {
+            AssetId::Uuid {
+                uuid: bevy_asset::uuid::Uuid::from_u128(n),
+            }
+        }
+
+        /// `main` imports from `file1`, which imports from `file2`. Each module names only its
+        /// own direct dependency; the chain is walked as each is registered.
+        #[test]
+        fn transitive_import_chain() {
+            let mut cache = test_cache();
+
+            let file2 = Shader::from_wesl(
+                "fn grand() -> f32 { return 1.0; }",
+                "embedded://pkg/file2.wesl",
+            );
+            let file1 = Shader::from_wesl(
+                "import pkg::file2::grand;\nfn mid() -> f32 { return grand(); }",
+                "embedded://pkg/file1.wesl",
+            );
+            let root = Shader::from_wesl(
+                "import pkg::file1::mid;\n@fragment fn fragment() -> @location(0) vec4<f32> \
+                 { return vec4<f32>(mid()); }",
+                "embedded://pkg/main.wesl",
+            );
+
+            cache.set_shader(id(12), file2);
+            cache.set_shader(id(11), file1);
+            cache.set_shader(id(10), root);
+
+            let compiled = cache.get(0, id(10), &[]).unwrap();
+            assert!(compiled.contains("fn fragment"));
+            assert!(
+                compiled.contains("return 1.0"),
+                "transitive body missing: {compiled}"
+            );
+        }
+
+        /// A diamond: `main` imports `foo` from `file1` and `bar` from `file2`, and `file2`
+        /// itself imports `foo`. `foo` must appear exactly once in the output.
+        #[test]
+        fn diamond_import_yields_one_copy() {
+            let mut cache = test_cache();
+
+            let file1 = Shader::from_wesl(
+                "fn foo() -> f32 { return 7.0; }",
+                "embedded://pkg/file1.wesl",
+            );
+            let file2 = Shader::from_wesl(
+                "import pkg::file1::foo;\nfn bar() -> f32 { return foo(); }",
+                "embedded://pkg/file2.wesl",
+            );
+            let root = Shader::from_wesl(
+                "import pkg::file1::foo;\nimport pkg::file2::bar;\n\
+                 @fragment fn fragment() -> @location(0) vec4<f32> \
+                 { return vec4<f32>(foo() + bar()); }",
+                "embedded://pkg/main.wesl",
+            );
+
+            cache.set_shader(id(21), file1);
+            cache.set_shader(id(22), file2);
+            cache.set_shader(id(20), root);
+
+            let compiled = cache.get(0, id(20), &[]).unwrap();
+            assert_eq!(
+                compiled.matches("return 7.0").count(),
+                1,
+                "foo duplicated: {compiled}"
+            );
+        }
+
+        /// An imported name may collide with a local declaration; mangling keeps them distinct.
+        #[test]
+        fn imported_name_conflicting_with_a_local_declaration() {
+            let mut cache = test_cache();
+
+            let file1 = Shader::from_wesl(
+                "fn conflict() -> f32 { return 2.0; }",
+                "embedded://pkg/file1.wesl",
+            );
+            let root = Shader::from_wesl(
+                "import pkg::file1::conflict as imported;\n\
+                 fn conflict() -> f32 { return 3.0; }\n\
+                 @fragment fn fragment() -> @location(0) vec4<f32> \
+                 { return vec4<f32>(conflict() + imported()); }",
+                "embedded://pkg/main.wesl",
+            );
+
+            cache.set_shader(id(31), file1);
+            cache.set_shader(id(30), root);
+
+            let compiled = cache.get(0, id(30), &[]).unwrap();
+            assert!(
+                compiled.contains("return 2.0"),
+                "imported fn missing: {compiled}"
+            );
+            assert!(
+                compiled.contains("return 3.0"),
+                "local fn missing: {compiled}"
+            );
+        }
+
+        /// Two modules importing from each other must terminate rather than recurse forever.
+        #[test]
+        fn circular_import_terminates() {
+            let mut cache = test_cache();
+
+            let file1 = Shader::from_wesl(
+                "import pkg::main::from_main;\nfn from_file1() -> f32 { return 1.0; }",
+                "embedded://pkg/file1.wesl",
+            );
+            let root = Shader::from_wesl(
+                "import pkg::file1::from_file1;\n\
+                 fn from_main() -> f32 { return 2.0; }\n\
+                 @fragment fn fragment() -> @location(0) vec4<f32> \
+                 { return vec4<f32>(from_file1()); }",
+                "embedded://pkg/main.wesl",
+            );
+
+            cache.set_shader(id(41), file1);
+            cache.set_shader(id(40), root);
+
+            // The assertion is that this returns at all.
+            let compiled = cache.get(0, id(40), &[]).unwrap();
+            assert!(compiled.contains("fn fragment"));
+        }
     }
 }
