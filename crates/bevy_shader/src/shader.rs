@@ -80,41 +80,47 @@ fn scan_wesl_imports(
 
     let used = used_module_paths(&translation_unit);
 
-    // A use site's leading segment always parses as the path's origin, never as a component:
-    // `super`, `package` and `self` are keywords, so a name an import could have bound can
-    // only appear here.
-    let head = |path: &ModulePath| match &path.origin {
-        PathOrigin::Package(package) => Some(package.clone()),
-        _ => None,
-    };
+    // The name a use site leads with. It always parses as the path's origin rather than a
+    // component, because `super`, `package` and `self` are keywords, so a name an import
+    // could have bound can only appear here.
+    fn head(path: &ModulePath) -> Option<&str> {
+        match &path.origin {
+            PathOrigin::Package(package) => Some(package),
+            _ => None,
+        }
+    }
 
     // A bare use binds the item inside the module it was imported from, so that module is the
     // dependency. A qualified use instead reaches *into* the item, making it a module in its
-    // own right — so the path is extended with the item's real name, renaming having changed
-    // what the use site says and not what the module is called.
+    // own right.
     for (bound, _, parent) in &paths {
-        if !used.iter().any(|path| head(path).as_ref() == Some(bound)) {
+        if !used.iter().any(|path| head(path) == Some(bound.as_str())) {
             push_required(&mut required, parent.clone());
         }
     }
 
-    // A use site may also spell a module path out in full. If its head is a name an import
-    // bound, the rest of the path continues from that import; otherwise the whole path is
-    // relative to this module.
+    // A use site may also spell a module path out in full. If it leads with a name an import
+    // bound, the rest of the path continues from that import — extended with the item's *real*
+    // name, renaming having changed what the use site says and not what the module is called.
+    // Otherwise the whole path is relative to this module.
     for path in &used {
-        match head(path).and_then(|head| {
+        let imported = head(path).and_then(|head| {
             paths
                 .iter()
-                .find(|(bound, _, _)| *bound == head)
+                .find(|(bound, _, _)| bound == head)
                 .map(|(_, real, parent)| (real, parent))
-        }) {
-            Some((real, parent)) => {
-                let mut module = parent.clone();
-                module.push(real);
-                push_required(&mut required, module.join(path.components.iter().cloned()));
-            }
-            None => push_required(&mut required, self_module_path.join_path(path)),
-        }
+        });
+        push_required(
+            &mut required,
+            match imported {
+                Some((real, parent)) => {
+                    let mut module = parent.clone();
+                    module.push(real);
+                    module.join(path.components.iter().cloned())
+                }
+                None => self_module_path.join_path(path),
+            },
+        );
     }
 
     let mut imports: Vec<ShaderImport> = Vec::new();
@@ -153,7 +159,9 @@ fn scan_wesl_imports(
 fn used_module_paths(
     translation_unit: &wesl::syntax::TranslationUnit,
 ) -> Vec<&wesl::syntax::ModulePath> {
-    use wesl::syntax::{Expression, GlobalDeclaration, ModulePath, Statement, TypeExpression};
+    use wesl::syntax::{
+        CompoundStatement, Expression, GlobalDeclaration, ModulePath, Statement, TypeExpression,
+    };
 
     fn visit_type_expression<'a>(ty: &'a TypeExpression, out: &mut Vec<&'a ModulePath>) {
         if let Some(path) = &ty.path {
@@ -189,6 +197,12 @@ fn used_module_paths(
         }
     }
 
+    fn visit_body<'a>(body: &'a CompoundStatement, out: &mut Vec<&'a ModulePath>) {
+        for statement in &body.statements {
+            visit_statement(statement, out);
+        }
+    }
+
     fn visit_statement<'a>(statement: &'a Statement, out: &mut Vec<&'a ModulePath>) {
         let mut expression = |expression| visit_expression(expression, out);
         match statement {
@@ -196,11 +210,7 @@ fn used_module_paths(
             | Statement::Break(_)
             | Statement::Continue(_)
             | Statement::Discard(_) => {}
-            Statement::Compound(inner) => {
-                for statement in &inner.statements {
-                    visit_statement(statement, out);
-                }
-            }
+            Statement::Compound(inner) => visit_body(inner, out),
             Statement::Assignment(inner) => {
                 expression(&inner.lhs);
                 expression(&inner.rhs);
@@ -209,19 +219,13 @@ fn used_module_paths(
             Statement::Decrement(inner) => expression(&inner.expression),
             Statement::If(inner) => {
                 visit_expression(&inner.if_clause.expression, out);
-                for statement in &inner.if_clause.body.statements {
-                    visit_statement(statement, out);
-                }
+                visit_body(&inner.if_clause.body, out);
                 for clause in &inner.else_if_clauses {
                     visit_expression(&clause.expression, out);
-                    for statement in &clause.body.statements {
-                        visit_statement(statement, out);
-                    }
+                    visit_body(&clause.body, out);
                 }
                 if let Some(clause) = &inner.else_clause {
-                    for statement in &clause.body.statements {
-                        visit_statement(statement, out);
-                    }
+                    visit_body(&clause.body, out);
                 }
             }
             Statement::Switch(inner) => {
@@ -232,19 +236,13 @@ fn used_module_paths(
                             visit_expression(expression, out);
                         }
                     }
-                    for statement in &clause.body.statements {
-                        visit_statement(statement, out);
-                    }
+                    visit_body(&clause.body, out);
                 }
             }
             Statement::Loop(inner) => {
-                for statement in &inner.body.statements {
-                    visit_statement(statement, out);
-                }
+                visit_body(&inner.body, out);
                 if let Some(continuing) = &inner.continuing {
-                    for statement in &continuing.body.statements {
-                        visit_statement(statement, out);
-                    }
+                    visit_body(&continuing.body, out);
                     if let Some(break_if) = &continuing.break_if {
                         visit_expression(&break_if.expression, out);
                     }
@@ -260,15 +258,11 @@ fn used_module_paths(
                 if let Some(statement) = &inner.update {
                     visit_statement(statement, out);
                 }
-                for statement in &inner.body.statements {
-                    visit_statement(statement, out);
-                }
+                visit_body(&inner.body, out);
             }
             Statement::While(inner) => {
                 visit_expression(&inner.condition, out);
-                for statement in &inner.body.statements {
-                    visit_statement(statement, out);
-                }
+                visit_body(&inner.body, out);
             }
             Statement::Return(inner) => {
                 if let Some(expression) = &inner.expression {
@@ -317,9 +311,7 @@ fn used_module_paths(
                 if let Some(ty) = &inner.return_type {
                     visit_type_expression(ty, &mut out);
                 }
-                for statement in &inner.body.statements {
-                    visit_statement(statement, &mut out);
-                }
+                visit_body(&inner.body, &mut out);
             }
             GlobalDeclaration::ConstAssert(inner) => visit_expression(&inner.expression, &mut out),
             _ => {}
