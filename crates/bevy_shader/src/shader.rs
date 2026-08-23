@@ -7,27 +7,21 @@ use thiserror::Error;
 
 /// Scans a WESL source for the modules it depends on.
 ///
-/// An import statement alone is ambiguous: `import a::b::c` cannot be told apart from the same
-/// text where `c` names the module `a/b/c` — both parse as an
-/// [`ImportContent::Item`](wesl::syntax::ImportContent::Item). The disambiguating signal is how
-/// the name is *used*, not how it is imported, and this mirrors how the upstream `wesl` compiler
-/// resolves it (`wesl::import::resolve_ty`):
+/// `import a::b::c` always parses as the item `c` in module `a::b`, so what makes `c` a module
+/// is how it is *used*, matching the upstream `wesl` compiler's `resolve_ty`:
 ///
 /// * a bare use of `c` binds the item `c` inside module `a::b`, so only `a::b` is needed;
 /// * a qualified use of `c::Item` reaches into the module `a::b::c`, so that module is needed too.
 ///
-/// Imports are therefore only a name → path table; a module becomes a dependency when a
-/// declaration actually refers to it. Nothing is guessed and no path that cannot exist is ever
-/// produced, so no dependency is fetched speculatively.
+/// Nothing is guessed, so no dependency is ever fetched speculatively.
 fn scan_wesl_imports(
     source: &str,
     self_module_path: &wesl::syntax::ModulePath,
 ) -> Vec<ShaderImport> {
     use wesl::syntax::{ImportContent, ModulePath, PathOrigin};
 
-    /// Collects, for each import, the name it binds locally, the item's real name, and the
-    /// module path the item lives in. The bound name is what a use site refers to; the real name
-    /// is what a path component must be built from, and the two differ under `as` renaming.
+    /// Collects `(bound name, real name, module the item lives in)` per import. The two names
+    /// differ under `as` renaming: use sites say the bound one, paths are built from the real one.
     fn leaves(
         content: &ImportContent,
         path: ModulePath,
@@ -78,50 +72,49 @@ fn scan_wesl_imports(
     }
 
     let mut required: Vec<ModulePath> = Vec::new();
-    let mut push_required = |path: ModulePath| {
+    fn push_required(required: &mut Vec<ModulePath>, path: ModulePath) {
         if !required.contains(&path) {
             required.push(path);
         }
+    }
+
+    let used = used_module_paths(&translation_unit);
+
+    // A use site's leading segment always parses as the path's origin, never as a component:
+    // `super`, `package` and `self` are keywords, so a name an import could have bound can
+    // only appear here.
+    let head = |path: &ModulePath| match &path.origin {
+        PathOrigin::Package(package) => Some(package.clone()),
+        _ => None,
     };
 
-    let used = used_type_expressions(&translation_unit);
-
-    // The leading segment written at a use site. `color::TINT` parses with `color` as the path's
-    // *origin*, not as a component, so both places have to be consulted.
-    fn leading_segment(path: &ModulePath) -> Option<&str> {
-        match &path.origin {
-            PathOrigin::Package(package) => Some(package.as_str()),
-            _ => path.components.first().map(String::as_str),
+    // A bare use binds the item inside the module it was imported from, so that module is the
+    // dependency. A qualified use instead reaches *into* the item, making it a module in its
+    // own right — so the path is extended with the item's real name, renaming having changed
+    // what the use site says and not what the module is called.
+    for (bound, _, parent) in &paths {
+        if !used.iter().any(|path| head(path).as_ref() == Some(bound)) {
+            push_required(&mut required, parent.clone());
         }
     }
 
-    // Renaming changes what a use site says, not what the module is called, so the path is
-    // extended with the item's real name rather than the bound one.
-    for (bound, real, parent) in &paths {
-        let qualified = used.iter().any(|ty| {
-            ty.path
-                .as_ref()
-                .and_then(leading_segment)
-                .is_some_and(|first| first == bound)
-        });
-        let mut path = parent.clone();
-        if qualified {
-            path.push(real);
+    // A use site may also spell a module path out in full. If its head is a name an import
+    // bound, the rest of the path continues from that import; otherwise the whole path is
+    // relative to this module.
+    for path in &used {
+        match head(path).and_then(|head| {
+            paths
+                .iter()
+                .find(|(bound, _, _)| *bound == head)
+                .map(|(_, real, parent)| (real, parent))
+        }) {
+            Some((real, parent)) => {
+                let mut module = parent.clone();
+                module.push(real);
+                push_required(&mut required, module.join(path.components.iter().cloned()));
+            }
+            None => push_required(&mut required, self_module_path.join_path(path)),
         }
-        push_required(path);
-    }
-
-    // A use site may also spell a module path in full, with no import statement introducing it.
-    // `ty.ident` names the used declaration, so the path itself is the module.
-    for ty in &used {
-        let Some(path) = &ty.path else { continue };
-        // Paths rooted at an imported name were handled above.
-        if leading_segment(path)
-            .is_some_and(|first| paths.iter().any(|(bound, _, _)| bound == first))
-        {
-            continue;
-        }
-        push_required(self_module_path.join_path(path));
     }
 
     let mut imports: Vec<ShaderImport> = Vec::new();
@@ -152,30 +145,27 @@ fn scan_wesl_imports(
     imports
 }
 
-/// Collects every [`TypeExpression`](wesl::syntax::TypeExpression) reachable from a module's
-/// declarations.
+/// Collects the module path written at each use site, e.g. the `color` of `color::TINT` or the
+/// `super::file` of `super::file::item()`.
 ///
-/// A `TypeExpression` is where a name is *used*, and its `path` is the qualification written at
-/// that use site. This is the same information the upstream `wesl` compiler walks in
-/// `resolve_ty`, and it covers both forms a dependency can take:
-///
-/// * `c::Item`, where `c` was introduced by an import — `path` is `Some(c)`;
-/// * `super::file::item`, written inline with no import statement at all — `path` is the whole
-///   qualification.
-fn used_type_expressions(
+/// Only a [`TypeExpression`](wesl::syntax::TypeExpression) carries one, so this walks the same
+/// nodes the upstream `wesl` compiler does in `resolve_ty`.
+fn used_module_paths(
     translation_unit: &wesl::syntax::TranslationUnit,
-) -> Vec<&wesl::syntax::TypeExpression> {
-    use wesl::syntax::{Expression, GlobalDeclaration, Statement, TypeExpression};
+) -> Vec<&wesl::syntax::ModulePath> {
+    use wesl::syntax::{Expression, GlobalDeclaration, ModulePath, Statement, TypeExpression};
 
-    fn visit_type_expression<'a>(ty: &'a TypeExpression, out: &mut Vec<&'a TypeExpression>) {
-        out.push(ty);
+    fn visit_type_expression<'a>(ty: &'a TypeExpression, out: &mut Vec<&'a ModulePath>) {
+        if let Some(path) = &ty.path {
+            out.push(path);
+        }
         // Template arguments are themselves expressions, e.g. `array<pkg::mod::T, 4>`.
         for argument in ty.template_args.iter().flatten() {
             visit_expression(&argument.expression, out);
         }
     }
 
-    fn visit_expression<'a>(expression: &'a Expression, out: &mut Vec<&'a TypeExpression>) {
+    fn visit_expression<'a>(expression: &'a Expression, out: &mut Vec<&'a ModulePath>) {
         match expression {
             Expression::Literal(_) => {}
             Expression::Parenthesized(inner) => visit_expression(&inner.expression, out),
@@ -199,7 +189,7 @@ fn used_type_expressions(
         }
     }
 
-    fn visit_statement<'a>(statement: &'a Statement, out: &mut Vec<&'a TypeExpression>) {
+    fn visit_statement<'a>(statement: &'a Statement, out: &mut Vec<&'a ModulePath>) {
         let mut expression = |expression| visit_expression(expression, out);
         match statement {
             Statement::Void
@@ -643,32 +633,24 @@ mod tests {
     }
 
     /// A module path may be written inline in a declaration, with no import statement at all.
-    /// The module is still a dependency.
+    /// The module is still a dependency, whatever the path's origin or where it is written.
     ///
     /// Derived from the `inline super:: reference`, `inline package reference` and
     /// `uninitialized override` cases in `wesl-testsuite`'s `importCases.json`.
     #[test]
     fn inline_path_without_an_import_is_a_dependency() {
-        let shader = Shader::from_wesl("fn main() { super::file1::bar(); }", "shaders/main.wesl");
+        let relative = Shader::from_wesl("fn main() { super::file1::bar(); }", "shaders/main.wesl");
+        assert_eq!(relative.imports, vec![asset("/shaders/file1")]);
 
-        assert_eq!(shader.imports, vec![asset("/shaders/file1")]);
-    }
-
-    #[test]
-    fn inline_package_path_is_a_dependency() {
-        let shader = Shader::from_wesl(
+        let absolute = Shader::from_wesl(
             "fn main() { package::shaders::foo::bar(); }",
             "shaders/main.wesl",
         );
+        assert_eq!(absolute.imports, vec![asset("/shaders/foo")]);
 
-        assert_eq!(shader.imports, vec![asset("/shaders/foo")]);
-    }
-
-    #[test]
-    fn inline_path_in_a_global_initializer_is_a_dependency() {
-        let shader = Shader::from_wesl("var a = package::shaders::file::b;", "shaders/main.wesl");
-
-        assert_eq!(shader.imports, vec![asset("/shaders/file")]);
+        let initializer =
+            Shader::from_wesl("var a = package::shaders::file::b;", "shaders/main.wesl");
+        assert_eq!(initializer.imports, vec![asset("/shaders/file")]);
     }
 
     /// A bare use of an imported name binds a declaration in the parent module, so only the
@@ -700,11 +682,7 @@ mod tests {
             "shaders/root.wesl",
         );
 
-        assert!(
-            shader.imports.contains(&asset("/shaders/utils/color")),
-            "nested module must be a dependency, got {:?}",
-            shader.imports
-        );
+        assert_eq!(shader.imports, vec![asset("/shaders/utils/color")]);
     }
 
     /// Importing an item from a nested module needs both: the module is reached by the qualified
@@ -720,6 +698,18 @@ mod tests {
         assert_eq!(shader.imports, vec![asset("/shaders/utils/color")]);
     }
 
+    /// A module may be nested under one reached by an import. The components written after the
+    /// imported name are part of the module path and must not be dropped.
+    #[test]
+    fn module_nested_under_an_imported_name_is_a_dependency() {
+        let shader = Shader::from_wesl(
+            "import package::shaders::a::b;\nfn f() { b::c::D(); }",
+            "shaders/main.wesl",
+        );
+
+        assert_eq!(shader.imports, vec![asset("/shaders/a/b/c")]);
+    }
+
     /// A renamed import is used under its alias, so the alias is what decides.
     #[test]
     fn alias_is_what_decides_the_reading() {
@@ -729,10 +719,25 @@ mod tests {
             "shaders/root.wesl",
         );
 
-        assert!(
-            shader.imports.contains(&asset("/shaders/utils/color")),
-            "alias used qualified must reach the nested module, got {:?}",
-            shader.imports
-        );
+        assert_eq!(shader.imports, vec![asset("/shaders/utils/color")]);
+    }
+
+    /// End-to-end over the real `assets/shaders/custom_material.wesl` used by the
+    /// `shader_material` example — the exact file that reproduced bevyengine/bevy#25363.
+    ///
+    /// The asset loader turns every `AssetPath` import into a fetch, so this pins the whole
+    /// set of requests. `COLOR_MULTIPLIER` is a `const`, not a file, and must never be one.
+    #[test]
+    fn real_example_asset_fetches_only_real_modules() {
+        let source = include_str!("../../../assets/shaders/custom_material.wesl");
+        let shader = Shader::from_wesl(source, "shaders/custom_material.wesl");
+
+        let fetched: Vec<&ShaderImport> = shader
+            .imports
+            .iter()
+            .filter(|import| matches!(import, ShaderImport::AssetPath(_)))
+            .collect();
+
+        assert_eq!(fetched, vec![&asset("/shaders/custom_material_import")]);
     }
 }
